@@ -20,7 +20,7 @@ use std::os::raw as libc;
 use self::raw::RawConnection;
 use self::statement_iterator::*;
 use self::stmt::{Statement, StatementUse};
-use super::SqliteAggregateFunction;
+use super::{SqliteAggregateFunction, SqliteTokenizerFunction};
 use crate::connection::instrumentation::{DynInstrumentation, StrQueryHelper};
 use crate::connection::statement_cache::StatementCache;
 use crate::connection::*;
@@ -546,6 +546,49 @@ impl SqliteConnection {
             .map_err(CouldntSetupConfiguration)?;
         Ok(conn)
     }
+
+    /// Register custom tokenizer for fts(full text search).
+    ///
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use diesel::SqliteTokenizerFunction;
+    ///
+    /// include!("../../doctest_setup.rs");
+    /// #
+    /// # struct CustomTokenizer;
+    /// # impl SqliteTokenizerFunction for CustomTokenizer {
+    /// #    type Data = ();
+    /// #
+    /// #   fn new(data: &Self::Data, args: Vec<String>) -> QueryResult<Self> {
+    /// #       Ok(Tokenizer)
+    /// #   }
+    /// #
+    /// #   fn tokenize<F>(&mut self, flags: i32, text: &[u8], push_token: F) -> QueryResult<()>
+    /// #   where
+    /// #       F: FnMut(&[u8], Range<usize>, bool) -> QueryResult<()> {
+    /// #       Ok(())
+    /// #   }
+    /// # }
+    /// #
+    /// # fn main() {
+    /// #     run_test().unwrap();
+    /// # }
+    /// #
+    /// # fn run_test() -> QueryResult<()> {
+    /// #     let mut conn = SqliteConnection::establish(":memory:").unwrap();
+    /// conn.register_custom_tokenizer::<CustomTokenizer>((), "custom")
+    /// # }
+    /// ```
+    pub fn register_custom_tokenizer<T: SqliteTokenizerFunction>(
+        &self,
+        data: T::Data,
+        name: &str,
+    ) -> QueryResult<()> {
+        self.raw_connection
+            .register_custom_tokenizer::<T>(data, name)
+    }
 }
 
 fn error_message(err_code: libc::c_int) -> &'static str {
@@ -930,6 +973,9 @@ mod tests {
             .load::<String>(connection);
         assert_eq!(Ok(&[][..]), result.as_ref().map(|vec| vec.as_ref()));
     }
+
+    #[test]
+    fn register_custom_tokenizer_function() {}
 
     // regression test for https://github.com/diesel-rs/diesel/issues/3425
     #[test]

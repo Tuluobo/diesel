@@ -1,7 +1,7 @@
 #![allow(unsafe_code)] // ffi calls
 extern crate libsqlite3_sys as ffi;
 
-use std::ffi::{CString, NulError};
+use std::ffi::{c_char, c_int, c_void, CStr, CString, NulError};
 use std::io::{stderr, Write};
 use std::os::raw as libc;
 use std::ptr::NonNull;
@@ -10,7 +10,7 @@ use std::{mem, ptr, slice, str};
 use super::functions::{build_sql_function_args, process_sql_function_result};
 use super::serialized_database::SerializedDatabase;
 use super::stmt::ensure_sqlite_ok;
-use super::{Sqlite, SqliteAggregateFunction};
+use super::{Sqlite, SqliteAggregateFunction, SqliteTokenizerFunction};
 use crate::deserialize::FromSqlRow;
 use crate::result::Error::DatabaseError;
 use crate::result::*;
@@ -214,6 +214,73 @@ impl RawConnection {
 
             ensure_sqlite_ok(result, self.internal_connection.as_ptr())
         }
+    }
+
+    pub(super) fn register_custom_tokenizer<T: SqliteTokenizerFunction>(
+        &self,
+        data: T::Data,
+        name: &str,
+    ) -> QueryResult<()> {
+        let mut stmt = ptr::null_mut();
+        let mut unused_portion = ptr::null();
+        // the cast for `ffi::SQLITE_PREPARE_PERSISTENT` is required for old libsqlite3-sys versions
+        let select_fts = "SELECT fts5(?1)";
+        #[allow(clippy::unnecessary_cast)]
+        let prepare_result = unsafe {
+            ffi::sqlite3_prepare_v3(
+                self.internal_connection.as_ptr(),
+                CString::new(select_fts)?.as_ptr(),
+                select_fts.len() as libc::c_int,
+                0,
+                &mut stmt,
+                &mut unused_portion,
+            )
+        };
+        ensure_sqlite_ok(prepare_result, self.internal_connection.as_ptr())?;
+
+        let mut p_api: *mut ffi::fts5_api = ptr::null_mut();
+        let bind_result = unsafe {
+            ffi::sqlite3_bind_pointer(
+                stmt,
+                1,
+                (&mut p_api) as *mut _ as *mut libc::c_void,
+                "fts5_api_ptr\0".as_ptr().cast::<libc::c_char>(),
+                None,
+            )
+        };
+        ensure_sqlite_ok(bind_result, self.internal_connection.as_ptr())?;
+
+        unsafe {
+            ffi::sqlite3_step(stmt);
+            ffi::sqlite3_finalize(stmt);
+        }
+        if p_api.is_null() {
+            return Err(DatabaseError(
+                DatabaseErrorKind::FtsApiFailure,
+                Box::new("fts5_api_ptr is null".to_string()),
+            ));
+        }
+
+        let tokenizer_name = Self::get_fn_name(name)?;
+        let data = Box::into_raw(Box::new(data));
+
+        unsafe {
+            (*p_api).xCreateTokenizer.map(|f| {
+                f(
+                    p_api,
+                    tokenizer_name.as_ptr(),
+                    data.cast::<libc::c_void>(),
+                    &mut ffi::fts5_tokenizer {
+                        xCreate: Some(run_create_tokenizer::<T>),
+                        xDelete: Some(run_delete_tokenizer::<T>),
+                        xTokenize: Some(run_tokenizer::<T>),
+                    },
+                    Some(destroy_boxed::<T::Data>),
+                )
+            });
+        }
+
+        Ok(())
     }
 
     fn get_fn_name(fn_name: &str) -> Result<CString, NulError> {
@@ -598,6 +665,129 @@ where
         Err(SqliteCallbackError::Panic(msg)) => {
             eprintln!("Collation function {} panicked", msg);
             std::process::abort()
+        }
+    }
+}
+
+#[allow(warnings)]
+unsafe extern "C" fn run_create_tokenizer<T: SqliteTokenizerFunction>(
+    data: *mut c_void,
+    args: *mut *const c_char,
+    nargs: c_int,
+    tokenizer: *mut *mut ffi::Fts5Tokenizer,
+) -> c_int {
+    let user_ptr = data as *const T::Data;
+    let user_ptr = std::panic::AssertUnwindSafe(unsafe { user_ptr.as_ref() });
+
+    let result = std::panic::catch_unwind(|| {
+        let user_ptr = user_ptr.ok_or_else(|| {
+            SqliteCallbackError::Abort(
+                "Got a null pointer as data pointer. This should never happen",
+            )
+        })?;
+
+        let args = (0..nargs as usize)
+            .map(|i| *args.add(i))
+            .map(|s| CStr::from_ptr(s).to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        Ok(T::new(user_ptr, args)?)
+    })
+    .unwrap_or_else(|p| {
+        Err(SqliteCallbackError::Panic(
+            "Custom tokenizer create function failed.".to_string(),
+        ))
+    });
+
+    match result {
+        Ok(t) => {
+            *tokenizer = Box::into_raw(Box::new(t)).cast::<ffi::Fts5Tokenizer>();
+            ffi::SQLITE_OK
+        }
+        Err(SqliteCallbackError::Abort(a)) => {
+            eprintln!("Custom tokenizer create function failed with: {}", a);
+            std::process::abort()
+        }
+        Err(SqliteCallbackError::DieselError(e)) => {
+            eprintln!("Custom tokenizer create function failed with: {}", e);
+            std::process::abort()
+        }
+        Err(SqliteCallbackError::Panic(msg)) => {
+            eprintln!("Collation function {} panicked", msg);
+            std::process::abort()
+        }
+    }
+}
+
+#[allow(warnings)]
+extern "C" fn run_delete_tokenizer<T: SqliteTokenizerFunction>(v: *mut ffi::Fts5Tokenizer) {
+    let ptr = v as *mut T;
+    unsafe { std::mem::drop(Box::from_raw(ptr)) };
+}
+
+#[allow(warnings)]
+unsafe extern "C" fn run_tokenizer<T: SqliteTokenizerFunction>(
+    this: *mut ffi::Fts5Tokenizer,
+    ctx: *mut c_void,
+    flags: c_int,
+    data: *const c_char,
+    data_len: c_int,
+    push_token: Option<
+        unsafe extern "C" fn(*mut c_void, c_int, *const c_char, c_int, c_int, c_int) -> c_int,
+    >,
+) -> c_int {
+    let this = &mut *this.cast::<T>();
+    let data = std::slice::from_raw_parts(data.cast::<u8>(), data_len as usize);
+
+    let push_token = push_token.unwrap();
+    let push_token =
+        |token: &[u8], range: std::ops::Range<usize>, colocated: bool| -> QueryResult<()> {
+            let ntoken = c_int::try_from(token.len()).expect("Token length is took long");
+            assert!(
+                range.start <= data.len() && range.end <= data.len(),
+                "Token range is invalid. Range is {:?}, data length is {}",
+                range,
+                data.len(),
+            );
+            let start = range.start as c_int;
+            let end = range.end as c_int;
+            let flags = if colocated {
+                ffi::FTS5_TOKEN_COLOCATED
+            } else {
+                0
+            };
+
+            let res = (push_token)(
+                ctx,
+                flags,
+                token.as_ptr().cast::<c_char>(),
+                ntoken,
+                start,
+                end,
+            );
+            if res == ffi::SQLITE_OK {
+                Ok(())
+            } else {
+                todo!()
+                // Err(rusqlite::Error::SqliteFailure(
+                // 	rusqlite::ffi::Error::new(res),
+                // 	None,
+                // ))
+            }
+        };
+
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        this.tokenize(flags, data, push_token)
+    })) {
+        Ok(Ok(())) => ffi::SQLITE_OK,
+        // Ok(Err(rusqlite::Error::SqliteFailure(e, _))) => e.extended_code, TODO
+        Ok(Err(_)) => ffi::SQLITE_ERROR,
+        Err(msg) => {
+            // log::error!(
+            //     "<{} as Tokenizer>::tokenize paniced: {}",
+            //     std::any::type_name::<T>(),
+            //     panic_err_to_str(&msg)
+            // );
+            ffi::SQLITE_ERROR
         }
     }
 }

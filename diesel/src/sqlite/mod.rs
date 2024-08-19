@@ -50,3 +50,17 @@ pub mod sql_types {
     #[doc(inline)]
     pub use super::types::Timestamptz;
 }
+
+/// Trait for the implementation of a SQLite custom tokenizer function
+///
+/// This trait is to be used in fts(full text search) extension for defining a custom tokenizer.
+pub trait SqliteTokenizerFunction: Sized + Send + 'static {
+    /// Data available to the `new` function
+    type Data: Send + 'static;
+    /// Creates a new instance of the tokenizer
+    fn new(data: &Self::Data, args: Vec<String>) -> crate::QueryResult<Self>;
+    /// Tokenizes a string.
+    fn tokenize<F>(&mut self, flags: i32, text: &[u8], push_token: F) -> crate::QueryResult<()>
+    where
+        F: FnMut(&[u8], std::ops::Range<usize>, bool) -> crate::QueryResult<()>;
+}
