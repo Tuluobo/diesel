@@ -177,6 +177,10 @@ mod macros;
 #[macro_use]
 extern crate cfg_if;
 
+// https://github.com/diesel-rs/diesel/pull/1640/files
+#[cfg(feature = "sqlite")]
+pub extern crate libsqlite3_sys;
+
 #[cfg(test)]
 pub mod test_helpers;
 
